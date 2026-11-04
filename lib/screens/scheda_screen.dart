@@ -1,9 +1,22 @@
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:pdfrx/pdfrx.dart';
 import '../models/scheda.dart';
+import '../models/testo_item.dart';
 import '../services/supabase_service.dart';
 import '../widgets/canvas_disegno.dart';
+import '../widgets/livello_testi.dart';
+
+/// Strumenti disponibili: matita (disegna), mano (scorri), testo.
+enum Strumento { matita, mano, testo }
+
+/// Una modifica fatta dall'utente, per l'annulla in ordine cronologico.
+class _Azione {
+  final int pagina;
+  final bool testo; // true = modifica ai testi, false = tratto a mano libera
+  const _Azione(this.pagina, this.testo);
+}
 
 class SchedaScreen extends StatefulWidget {
   final Scheda scheda;
@@ -24,15 +37,27 @@ class SchedaScreen extends StatefulWidget {
 class _SchedaScreenState extends State<SchedaScreen> {
   PdfDocument? _doc;
   final Map<int, List<Tratto>> _tratti = {}; // pagina (1-based) -> tratti
+  final Map<int, List<TestoItem>> _testi = {}; // pagina (1-based) -> testi
   final Map<int, GlobalKey<CanvasDisegnoState>> _keys = {};
+  final Map<int, GlobalKey<LivelloTestiState>> _keysTesti = {};
+  final List<_Azione> _azioni = []; // cronologia per l'annulla
+  bool _inAnnulla = false;
   bool _caricamento = true;
   String? _errore;
   String _stato = 'Avvio...';
 
-  bool _disegna = true;
+  Strumento _strumento = Strumento.matita;
+  bool get _disegna => _strumento == Strumento.matita;
+
   Color _colore = Colors.blue;
   double _spessore = 4;
   int _paginaAttiva = 1;
+
+  // Zoom a pulsanti: 1.0 = pagina larga come lo schermo
+  double _zoom = 1.0;
+  static const double _zoomMin = 1.0;
+  static const double _zoomMax = 3.0;
+  static const double _zoomStep = 0.5;
 
   // 4 neutri + 12 tinte in 3 sfumature (scura, media, chiara)
   final List<Color> _palette = [
@@ -50,11 +75,15 @@ class _SchedaScreenState extends State<SchedaScreen> {
     if (mounted) setState(() => _stato = msg);
   }
 
+  void _cambiaZoom(double delta) {
+    setState(() => _zoom = (_zoom + delta).clamp(_zoomMin, _zoomMax));
+  }
+
   @override
   void initState() {
     super.initState();
     print('>>> SchedaScreen initState, pdfPath: "${widget.scheda.pdfPath}"');
-    _disegna = !widget.soloLettura;
+    _strumento = widget.soloLettura ? Strumento.mano : Strumento.matita;
     if (widget.autore == 'genitore') _colore = Colors.red; // correzioni in rosso
 
     // il bambino apre una scheda corretta: la notifica "NUOVO" sparisce
@@ -78,18 +107,26 @@ class _SchedaScreenState extends State<SchedaScreen> {
         sourceName: widget.scheda.pdfPath,
       );
 
-      _log('3) aperto: ${doc.pages.length} pagine, leggo i tratti...');
+      _log('3) aperto: ${doc.pages.length} pagine, leggo tratti e testi...');
       final risultati = await Future.wait([
         for (var p = 1; p <= doc.pages.length; p++)
           SupabaseService.caricaTratti(widget.scheda.id, p),
       ]);
+      final testiRis = await Future.wait([
+        for (var p = 1; p <= doc.pages.length; p++)
+          SupabaseService.caricaTesti(widget.scheda.id, p),
+      ]);
 
-      _log('4) tratti letti, costruisco la schermata');
+      _log('4) dati letti, costruisco la schermata');
       for (var i = 0; i < risultati.length; i++) {
         _tratti[i + 1] = risultati[i]
             .map((j) => Tratto.fromJson(Map<String, dynamic>.from(j)))
             .toList();
+        _testi[i + 1] = testiRis[i]
+            .map((j) => TestoItem.fromJson(Map<String, dynamic>.from(j)))
+            .toList();
         _keys[i + 1] = GlobalKey<CanvasDisegnoState>();
+        _keysTesti[i + 1] = GlobalKey<LivelloTestiState>();
       }
 
       if (!mounted) return;
@@ -128,6 +165,45 @@ class _SchedaScreenState extends State<SchedaScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Salvataggio non riuscito: $e')),
       );
+    }
+  }
+
+  Future<void> _salvaTesti(int pagina, List<TestoItem> testi) async {
+    _testi[pagina] = List.of(testi);
+    try {
+      await SupabaseService.salvaTesti(
+        widget.scheda.id,
+        pagina,
+        testi.map((t) => t.toJson()).toList(),
+      );
+      print('>>> salvati testi pagina $pagina (${testi.length} testi)');
+    } catch (e) {
+      print('>>> ERRORE salvataggio testi: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Salvataggio testo non riuscito: $e')),
+      );
+    }
+  }
+
+  // Annulla l'ultima modifica (tratto o testo), in ordine cronologico
+  void _annulla() {
+    if (_azioni.isEmpty) {
+      // nessuna azione di questa sessione: lascia fare al canvas come prima
+      _keys[_paginaAttiva]?.currentState?.annulla();
+      return;
+    }
+    final a = _azioni.removeLast();
+    _paginaAttiva = a.pagina;
+    _inAnnulla = true; // l'annullamento stesso non deve finire nella cronologia
+    try {
+      if (a.testo) {
+        _keysTesti[a.pagina]?.currentState?.annulla();
+      } else {
+        _keys[a.pagina]?.currentState?.annulla();
+      }
+    } finally {
+      _inAnnulla = false;
     }
   }
 
@@ -248,13 +324,26 @@ class _SchedaScreenState extends State<SchedaScreen> {
                 IconButton(
                   icon: const Icon(Icons.undo),
                   tooltip: 'Annulla',
-                  onPressed: () => _keys[_paginaAttiva]?.currentState?.annulla(),
+                  onPressed: _annulla,
                 ),
+                // matita <-> mano
                 IconButton(
                   icon: Icon(_disegna ? Icons.edit : Icons.pan_tool),
                   tooltip: _disegna ? 'Modalità matita' : 'Modalità scorri',
-                  onPressed: () => setState(() => _disegna = !_disegna),
+                  onPressed: () => setState(() => _strumento =
+                      _disegna ? Strumento.mano : Strumento.matita),
                 ),
+                // l'icona del testo compare quando sei in modalità mano
+                if (!_disegna)
+                  IconButton(
+                    icon: const Icon(Icons.text_fields),
+                    tooltip: 'Testo',
+                    isSelected: _strumento == Strumento.testo,
+                    onPressed: () => setState(() => _strumento =
+                        _strumento == Strumento.testo
+                            ? Strumento.mano
+                            : Strumento.testo),
+                  ),
                 if (widget.autore == 'bimbo')
                   TextButton.icon(
                     onPressed: _finito,
@@ -275,76 +364,135 @@ class _SchedaScreenState extends State<SchedaScreen> {
           : _barraStrumenti(),
     );
   }
-Widget _corpo() {
-  if (_caricamento) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const CircularProgressIndicator(),
-            const SizedBox(height: 16),
-            Text(_stato, textAlign: TextAlign.center),
-          ],
-        ),
-      ),
-    );
-  }
-  if (_errore != null) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Text('Errore: $_errore'),
-      ),
-    );
-  }
 
-  final doc = _doc!;
-  return ListView.builder(
-    physics: _disegna ? const NeverScrollableScrollPhysics() : null,
-    padding: const EdgeInsets.all(12),
-    itemCount: doc.pages.length,
-    itemBuilder: (context, i) {
-      final pagina = i + 1;
-      final p = doc.pages[i];
-      return Padding(
-        padding: const EdgeInsets.only(bottom: 16),
-        child: AspectRatio(
-          aspectRatio: p.width / p.height,
-          child: Material(
-            elevation: 4,
-            color: Colors.white,
-            child: InteractiveViewer(
-              panEnabled: false,       // un dito resta libero per disegnare/scrollare
-              scaleEnabled: true,      // due dita = pinch zoom
-              minScale: 1.0,
-              maxScale: 4.0,
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  _PaginaPdf(page: p),
-                  CanvasDisegno(
-                    key: _keys[pagina],
-                    autore: widget.autore,
-                    trattiIniziali: _tratti[pagina] ?? [],
-                    colore: _colore,
-                    spessore: _spessore,
-                    attivo: _disegna && !widget.soloLettura,
-                    onModificato: (t) {
-                      _paginaAttiva = pagina;
-                      _salva(pagina, t);
-                    },
-                  ),
-                ],
-              ),
-            ),
+  Widget _corpo() {
+    if (_caricamento) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const CircularProgressIndicator(),
+              const SizedBox(height: 16),
+              Text(_stato, textAlign: TextAlign.center),
+            ],
           ),
         ),
       );
-    },
-  );
-}
+    }
+    if (_errore != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text('Errore: $_errore'),
+        ),
+      );
+    }
+
+    final doc = _doc!;
+    return Stack(
+      children: [
+        LayoutBuilder(
+          builder: (context, vincoli) {
+            return SingleChildScrollView(
+              // scorrimento orizzontale (serve quando la pagina è ingrandita):
+              // in modalità matita il dito disegna, non scorre
+              scrollDirection: Axis.horizontal,
+              physics: _disegna ? const NeverScrollableScrollPhysics() : null,
+              child: SizedBox(
+                // con lo zoom la pagina diventa più larga dello schermo
+                width: vincoli.maxWidth * _zoom,
+                height: vincoli.maxHeight,
+                child: ListView.builder(
+                  physics: _disegna ? const NeverScrollableScrollPhysics() : null,
+                  padding: const EdgeInsets.all(12),
+                  itemCount: doc.pages.length,
+                  itemBuilder: (context, i) {
+                    final pagina = i + 1;
+                    final p = doc.pages[i];
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 16),
+                      child: AspectRatio(
+                        aspectRatio: p.width / p.height,
+                        child: Material(
+                          elevation: 4,
+                          color: Colors.white,
+                          child: Stack(
+                            fit: StackFit.expand,
+                            children: [
+                              _PaginaPdf(page: p),
+                              CanvasDisegno(
+                                key: _keys[pagina],
+                                autore: widget.autore,
+                                trattiIniziali: _tratti[pagina] ?? [],
+                                colore: _colore,
+                                spessore: _spessore,
+                                attivo: _disegna && !widget.soloLettura,
+                                onModificato: (t) {
+                                  _paginaAttiva = pagina;
+                                  if (!_inAnnulla) {
+                                    _azioni.add(_Azione(pagina, false));
+                                  }
+                                  _salva(pagina, t);
+                                },
+                              ),
+                              // livello dei testi, sopra il disegno
+                              LivelloTesti(
+                                key: _keysTesti[pagina],
+                                autore: widget.autore,
+                                testiIniziali: _testi[pagina] ?? [],
+                                colore: _colore,
+                                attivo: _strumento == Strumento.testo &&
+                                    !widget.soloLettura,
+                                onModificato: (t) {
+                                  _paginaAttiva = pagina;
+                                  if (!_inAnnulla) {
+                                    _azioni.add(_Azione(pagina, true));
+                                  }
+                                  _salvaTesti(pagina, t);
+                                },
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            );
+          },
+        ),
+
+        // Pulsanti zoom + e -
+        Positioned(
+          right: 16,
+          bottom: 16,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              FloatingActionButton.small(
+                heroTag: 'zoomPiu',
+                tooltip: 'Ingrandisci',
+                onPressed:
+                    _zoom < _zoomMax ? () => _cambiaZoom(_zoomStep) : null,
+                child: const Icon(Icons.add),
+              ),
+              const SizedBox(height: 8),
+              FloatingActionButton.small(
+                heroTag: 'zoomMeno',
+                tooltip: 'Rimpicciolisci',
+                onPressed:
+                    _zoom > _zoomMin ? () => _cambiaZoom(-_zoomStep) : null,
+                child: const Icon(Icons.remove),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
 
   Widget _barraStrumenti() {
     return SafeArea(
@@ -439,13 +587,18 @@ class _PaginaPdf extends StatefulWidget {
 }
 
 class _PaginaPdfState extends State<_PaginaPdf> {
+  // Limite di larghezza in pixel del rendering: evita di consumare troppa
+  // memoria quando la pagina è molto ingrandita
+  static const int _maxPixelLarghezza = 2800;
+
   ui.Image? _img;
   String? _err;
-  bool _avviato = false;
+  double _larghezzaRender = 0; // larghezza (in px logici) dell'ultimo render
+  bool _inCorso = false;
 
   Future<void> _render(double larghezza, double dpr) async {
     try {
-      final w = (larghezza * dpr).round();
+      final w = math.min((larghezza * dpr).round(), _maxPixelLarghezza);
       final h = (w * widget.page.height / widget.page.width).round();
       final pdfImg = await widget.page.render(
         width: w,
@@ -460,10 +613,15 @@ class _PaginaPdfState extends State<_PaginaPdf> {
         img.dispose();
         return;
       }
+      final vecchia = _img;
       setState(() => _img = img);
+      // l'immagine precedente si libera dopo il ridisegno
+      WidgetsBinding.instance.addPostFrameCallback((_) => vecchia?.dispose());
     } catch (e) {
       print('>>> ERRORE render pagina: $e');
       if (mounted) setState(() => _err = e.toString());
+    } finally {
+      _inCorso = false;
     }
   }
 
@@ -476,9 +634,19 @@ class _PaginaPdfState extends State<_PaginaPdf> {
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(builder: (context, c) {
-      if (!_avviato) {
-        _avviato = true;
-        _render(c.maxWidth, MediaQuery.of(context).devicePixelRatio);
+      // primo render, oppure la pagina è cambiata di larghezza (zoom)
+      if (!_inCorso && (c.maxWidth - _larghezzaRender).abs() > 1) {
+        _inCorso = true;
+        _larghezzaRender = c.maxWidth;
+        final larghezza = c.maxWidth;
+        final dpr = MediaQuery.of(context).devicePixelRatio;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) {
+            _render(larghezza, dpr);
+          } else {
+            _inCorso = false;
+          }
+        });
       }
       if (_err != null) return Center(child: Text('Errore PDF: $_err'));
       if (_img == null) return const Center(child: CircularProgressIndicator());
