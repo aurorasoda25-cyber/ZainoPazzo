@@ -14,6 +14,24 @@ class SupabaseService {
 
     return (response as List).map((json) => Materia.fromJson(json)).toList();
   }
+  static Future<List<dynamic>> caricaTesti(dynamic schedaId, int pagina) async {
+  final r = await Supabase.instance.client
+      .from('testi')
+      .select('dati')
+      .eq('scheda_id', schedaId)
+      .eq('pagina', pagina)
+      .maybeSingle();
+  return (r?['dati'] as List?) ?? [];
+}
+
+static Future<void> salvaTesti(
+    dynamic schedaId, int pagina, List<Map<String, dynamic>> dati) async {
+  await Supabase.instance.client.from('testi').upsert({
+    'scheda_id': schedaId,
+    'pagina': pagina,
+    'dati': dati,
+  });
+}
 
   static Future<List<Scheda>> getSchedePerMateria(int materiaId) async {
     final response = await client
@@ -82,4 +100,5 @@ static Future<void> segnaCorrezioneVista(int schedaId) async {
       'updated_at': DateTime.now().toIso8601String(),
     }, onConflict: 'scheda_id,pagina');
   }
+  
 }
